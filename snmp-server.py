@@ -15,13 +15,16 @@ import string
 import struct
 import sys
 import types
+
+from collections import Iterable
 from contextlib import closing
+
 try:
     from StringIO import StringIO
 except ImportError:
     from io import StringIO
 
-__version__ = '1.0.3'
+__version__ = '1.0.5'
 
 PY3 = sys.version_info[0] == 3
 
@@ -55,6 +58,7 @@ ASN1_GET_REQUEST_PDU = 0xA0
 ASN1_GET_NEXT_REQUEST_PDU = 0xA1
 ASN1_GET_RESPONSE_PDU = 0xA2
 ASN1_SET_REQUEST_PDU = 0xA3
+ASN1_GET_BULK_REQUEST_PDU = 0xA5
 
 # error statuses
 ASN1_ERROR_STATUS_NO_ERROR = 0x00
@@ -63,6 +67,7 @@ ASN1_ERROR_STATUS_NO_SUCH_NAME = 0x02
 ASN1_ERROR_STATUS_BAD_VALUE = 0x03
 ASN1_ERROR_STATUS_READ_ONLY = 0x04
 ASN1_ERROR_STATUS_GEN_ERR = 0x05
+ASN1_ERROR_STATUS_WRONG_VALUE = 0x0A
 
 # some ASN.1 opaque special types
 ASN1_CONTEXT = 0x80  # context-specific
@@ -106,6 +111,14 @@ class ProtocolError(Exception):
 
 class ConfigError(Exception):
     """Raise when config error occured"""
+
+
+class BadValueError(Exception):
+    """Raise when bad value error occured"""
+
+
+class WrongValueError(Exception):
+    """Raise when wrong value (e.g. value not in available range) error occured"""
 
 
 def encode_to_7bit(value):
@@ -209,23 +222,25 @@ def _read_int_len(stream, length, signed=False):
     return result
 
 
-def _write_int(value):
+def _write_int(value, strip_leading_zeros=True):
     """Write int"""
     if abs(value) > 0xffffffffffffffff:
         raise Exception('Int value must be in [0..18446744073709551615]')
     if value < 0:
-        if abs(value) <= 0xff:
+        if abs(value) <= 0x7f:
             result = struct.pack('>b', value)
-        elif abs(value) <= 0xffff:
+        elif abs(value) <= 0x7fff:
             result = struct.pack('>h', value)
-        elif abs(value) <= 0xffffffff:
+        elif abs(value) <= 0x7fffffff:
             result = struct.pack('>i', value)
-        elif abs(value) <= 0xffffffffffffffff:
+        elif abs(value) <= 0x7fffffffffffffff:
             result = struct.pack('>q', value)
     else:
         result = struct.pack('>Q', value)
     # strip first null bytes, if all are null - leave one
-    return result.lstrip(b'\x00') or b'\x00'
+    result = result.lstrip(b'\x00') if strip_leading_zeros else result
+    return result or b'\x00'
+
 
 def _write_asn1_length(length):
     """Write ASN.1 length"""
@@ -269,7 +284,7 @@ def _parse_asn1_octet_string(stream):
 def _parse_asn1_opaque_float(stream):
     """Parse ASN.1 opaque float"""
     length = _parse_asn1_length(stream)
-    value = _read_int_len(stream, length)
+    value = _read_int_len(stream, length, signed=True)
     # convert int to float
     float_value = struct.unpack('>f', struct.pack('>l', value))[0]
     logger.debug('ASN1_OPAQUE_FLOAT: %s', round(float_value, 5))
@@ -279,7 +294,7 @@ def _parse_asn1_opaque_float(stream):
 def _parse_asn1_opaque_double(stream):
     """Parse ASN.1 opaque double"""
     length = _parse_asn1_length(stream)
-    value = _read_int_len(stream, length)
+    value = _read_int_len(stream, length, signed=True)
     # convert long long to double
     double_value = struct.unpack('>d', struct.pack('>q', value))[0]
     logger.debug('ASN1_OPAQUE_DOUBLE: %s', round(double_value, 5))
@@ -348,7 +363,11 @@ def _parse_snmp_asn1(stream):
                 pdu_index in [1, 4, 5, 6] and tag != ASN1_INTEGER or
                 pdu_index == 2 and tag != ASN1_OCTET_STRING or
                 pdu_index == 3 and tag not in [
-                    ASN1_GET_REQUEST_PDU, ASN1_GET_NEXT_REQUEST_PDU, ASN1_SET_REQUEST_PDU]
+                    ASN1_GET_REQUEST_PDU,
+                    ASN1_GET_NEXT_REQUEST_PDU,
+                    ASN1_SET_REQUEST_PDU,
+                    ASN1_GET_BULK_REQUEST_PDU,
+                ]
         ):
             raise ProtocolError('Invalid tag for PDU unit "{}"'.format(SNMP_PDUS[pdu_index]))
         if tag == ASN1_SEQUENCE:
@@ -388,6 +407,11 @@ def _parse_snmp_asn1(stream):
             logger.debug('ASN1_GET_NEXT_REQUEST_PDU: %s', 'length = {}'.format(length))
             if pdu_index == 3:  # PDU-type
                 result.append(('ASN1_GET_NEXT_REQUEST_PDU', tag))
+        elif tag == ASN1_GET_BULK_REQUEST_PDU:
+            length = _parse_asn1_length(stream)
+            logger.debug('ASN1_GET_BULK_REQUEST_PDU: %s', 'length = {}'.format(length))
+            if pdu_index == 3:  # PDU-type
+                result.append(('ASN1_GET_BULK_REQUEST_PDU', tag))
         elif tag == ASN1_GET_RESPONSE_PDU:
             length = _parse_asn1_length(stream)
             logger.debug('ASN1_GET_RESPONSE_PDU: %s', 'length = {}'.format(length))
@@ -401,7 +425,7 @@ def _parse_snmp_asn1(stream):
             value = _read_int_len(stream, length)
             logger.debug('ASN1_TIMETICKS: %s (%s)', value, timeticks_to_str(value))
             if wait_oid_value:
-                result.append(('TIMETICKS', '({}) {}'.format(value, timeticks_to_str(value))))
+                result.append(('TIMETICKS', value))
                 wait_oid_value = False
         elif tag == ASN1_IPADDRESS:
             length = _read_byte(stream)
@@ -486,9 +510,16 @@ def boolean(value):
     return write_tlv(ASN1_BOOLEAN, 1, b'\xff' if value else b'\x00')
 
 
-def integer(value):
+def integer(value, enum=None):
     """Get Integer"""
-    return write_tv(ASN1_INTEGER, _write_int(value))
+    if enum and isinstance(enum, Iterable):
+        if not value in enum:
+            raise WrongValueError('Integer value {} is outside the range of enum values'.format(value))
+    if not (-2147483648 <= value <= 2147483647):
+        raise Exception('Integer value must be in [-2147483648..2147483647]')
+    if not enum:
+        return write_tv(ASN1_INTEGER, _write_int(value, False))
+    return write_tv(ASN1_INTEGER, _write_int(value, False)), enum
 
 
 def bit_string(value):
@@ -595,7 +626,7 @@ def gauge32(value):
     """Get Gauge32"""
     if value > 0xffffffff:
         raise Exception('Gauge32 value must be in [0..4294967295]')
-    return write_tv(ASN1_GAUGE32, _write_int(value))
+    return write_tv(ASN1_GAUGE32, _write_int(value, strip_leading_zeros=False))
 
 
 def counter32(value):
@@ -696,6 +727,8 @@ def handle_get_request(oids, oid):
     if not found:
         error_status = ASN1_ERROR_STATUS_NO_SUCH_NAME
         error_index = 1
+        # TODO: check this
+        oid_value = struct.pack('BB', ASN1_NO_SUCH_INSTANCE, 0)
     return error_status, error_index, oid_value
 
 
@@ -742,7 +775,10 @@ def handle_set_request(oids, oid, type_and_value):
     error_index = 0
     value_type, value = type_and_value
     if value_type == 'INTEGER':
-        oids[oid] = integer(value)
+        enum_values = None
+        if isinstance(oids[oid], tuple) and len(oids[oid]) > 1:
+            enum_values = oids[oid][1]
+        oids[oid] = integer(value, enum=enum_values)
     elif value_type == 'STRING':
         oids[oid] = octet_string(value if PY3 else value.encode('latin'))
     elif value_type == 'OID':
@@ -772,7 +808,7 @@ def handle_set_request(oids, oid, type_and_value):
     return error_status, error_index, oid_value
 
 
-def craft_response(version, community, request_id, error_status, error_index, oid_key, oid_value):
+def craft_response(version, community, request_id, error_status, error_index, oid_items):
     """Craft SNMP response"""
     response = write_tv(
         ASN1_SEQUENCE,
@@ -789,11 +825,16 @@ def craft_response(version, community, request_id, error_status, error_index, oi
             # add variable bindings
             write_tv(
                 ASN1_SEQUENCE,
-                # add OID and OID value
-                write_tv(
-                    ASN1_SEQUENCE,
-                    write_tv(ASN1_OBJECT_IDENTIFIER, oid_key.encode('latin') if PY3 else oid_key) +
-                    oid_value
+                b''.join(
+                    # add OID and OID value
+                    write_tv(
+                        ASN1_SEQUENCE,
+                        write_tv(
+                            ASN1_OBJECT_IDENTIFIER,
+                            oid_key.encode('latin') if PY3 else oid_key
+                        ) +
+                        oid_value
+                    ) for (oid_key, oid_value) in oid_items
                 )
             )
         )
@@ -821,38 +862,85 @@ def snmp_server(host, port, oids):
                 continue
 
             if len(request_result) < 7:
-                raise Exception('Invalid ASN.1 parse request result length!')
+                raise Exception('Invalid ASN.1 parsed request length!')
 
             # get required fields from request
             version = request_result[0][1]
             community = request_result[1][1]
             pdu_type = request_result[2][1]
             request_id = request_result[3][1]
-            oid = request_result[6][1]
+            max_repetitions = request_result[5][1]
+            logger.debug('max_repetitions %i', max_repetitions)
 
             error_status = ASN1_ERROR_STATUS_NO_ERROR
             error_index = 0
+            oid_items = []
             oid_value = null()
 
             # handle protocol data units
             if pdu_type == ASN1_GET_REQUEST_PDU:
-                error_status, error_index, oid_value = handle_get_request(oids, oid)
+                requested_oids = request_result[6:]
+                for _, oid in requested_oids:
+                    _, _, oid_value = handle_get_request(oids, oid)
+                    # if oid value is a function - call it to get the value
+                    if isinstance(oid_value, types.FunctionType):
+                        oid_value = oid_value(oid)
+                    if isinstance(oid_value, tuple):
+                        oid_value = oid_value[0]
+                    oid_items.append((oid_to_bytes(oid), oid_value))
+
             elif pdu_type == ASN1_GET_NEXT_REQUEST_PDU:
+                oid = request_result[6][1]
                 error_status, error_index, oid, oid_value = handle_get_next_request(oids, oid)
+                if isinstance(oid_value, types.FunctionType):
+                    oid_value = oid_value(oid)
+                if isinstance(oid_value, tuple):
+                    oid_value = oid_value[0]
+                oid_items.append((oid_to_bytes(oid), oid_value))
+
+            elif pdu_type == ASN1_GET_BULK_REQUEST_PDU:
+                requested_oids = request_result[6:]
+                for _ in range(0, max_repetitions):
+                    for idx, val in enumerate(requested_oids):
+                        oid = val[1]
+                        error_status, error_index, oid, oid_value = handle_get_next_request(oids, oid)
+                        if isinstance(oid_value, types.FunctionType):
+                            oid_value = oid_value(oid)
+                        if isinstance(oid_value, tuple):
+                            oid_value = oid_value[0]
+                        oid_items.append((oid_to_bytes(oid), oid_value))
+                        requested_oids[idx] = ('OID', oid)
+
             elif pdu_type == ASN1_SET_REQUEST_PDU:
                 if len(request_result) < 8:
-                    raise Exception('Invalid ASN.1 parse request result length for SNMP set request!')
+                    raise Exception('Invalid ASN.1 parsed request length for SNMP set request!')
+                oid = request_result[6][1]
                 type_and_value = request_result[7]
-                error_status, error_index, oid_value = handle_set_request(oids, oid, type_and_value)
+                try:
+                    if isinstance(oids[oid], tuple) and len(oids[oid]) > 1:
+                        enum_values = oids[oid][1]
+                        new_value = type_and_value[1]
+                        if isinstance(enum_values, Iterable) and new_value not in enum_values:
+                            raise WrongValueError('Value {} is outside the range of enum values'.format(new_value))
+                    error_status, error_index, oid_value = handle_set_request(oids, oid, type_and_value)
+                except WrongValueError as ex:
+                    logger.error(ex)
+                    error_status = ASN1_ERROR_STATUS_WRONG_VALUE
+                    error_index = 0
+                except Exception as ex:
+                    logger.error(ex)
+                    error_status = ASN1_ERROR_STATUS_BAD_VALUE
+                    error_index = 0
+                # if oid value is a function - call it to get the value
+                if isinstance(oid_value, types.FunctionType):
+                    oid_value = oid_value(oid)
+                if isinstance(oid_value, tuple):
+                    oid_value = oid_value[0]
+                oid_items.append((oid_to_bytes(oid), oid_value))
 
-            # get oid bytes
-            oid_key = oid_to_bytes(oid)
-            # if oid value is a function - call it to get the value
-            if isinstance(oid_value, types.FunctionType):
-                oid_value = oid_value(oid)
             # craft SNMP response
             response = craft_response(
-                version, community, request_id, error_status, error_index, oid_key, oid_value)
+                version, community, request_id, error_status, error_index, oid_items)
             logger.debug('Sending %d bytes of response', len(response))
             try:
                 sock.sendto(response, address)
